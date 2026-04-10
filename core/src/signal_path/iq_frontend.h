@@ -133,5 +133,6 @@ protected:
     double effectiveSr;
 
     bool _init = false;
+    bool _invertIQ = false;    // Fix issue #74: rastreia estado do Invert IQ
 
 };
