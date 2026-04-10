@@ -56,6 +56,9 @@ public:
         };
         gui::menu.registerEntry(name, menuHandler, this, NULL);
         updateBindings();
+        // FIX: nao chamamos mais actuateIFNR() aqui porque addPreprocessor ja
+        // insere o processador com bypass=true (desativado por padrao). O bypass
+        // e controlado diretamente no run() de IFNRLogMMSE.
         actuateIFNR();
     }
 
@@ -105,10 +108,10 @@ private:
         core::modComManager.callInterface(instanceName, RADIO_IFACE_CMD_ENABLE_IN_AFCHAIN, afnromlsa.get(), NULL);
 
         config.acquire();
-        bool afnr = true;
+        bool afnr = false;
         int frequency = 10;
         if (config.conf.contains("AF_NRF_" + instanceName)) frequency = config.conf["AF_NRF_" + instanceName];
-        bool afnr2 = true;
+        bool afnr2 = false;
         if (config.conf.contains("AF_NR_" + instanceName))  afnr  = config.conf["AF_NR_"  + instanceName];
         if (config.conf.contains("AF_NR2_" + instanceName)) afnr2 = config.conf["AF_NR2_" + instanceName];
         config.release(true);
@@ -146,7 +149,11 @@ private:
                 _this->drawSNRMeterAverages(gctx);
             };
 
-            sigpath::iqFrontEnd.addPreprocessor(&ifnrProcessor, false);
+            // FIX: inserimos o processador SEMPRE habilitado na chain (enabled=true).
+            // O controle de ativo/inativo e feito pelo bypass dentro do run() de
+            // IFNRLogMMSE, evitando o bug de blockBefore() no chain.h que impedia
+            // o re-enable apos um disable via togglePreprocessor.
+            sigpath::iqFrontEnd.addPreprocessor(&ifnrProcessor, true);
 
             sigpath::sourceManager.onTuneChanged.bindHandler(&currentFrequencyChangedHandler);
             currentFrequencyChangedHandler.ctx = this;
@@ -201,14 +208,12 @@ private:
     }
 
     void actuateIFNR() {
-        // FIX: a condicao de guarda anterior (bypass != !shouldRun) impedia que o
-        // togglePreprocessor fosse chamado na inicializacao quando bypass=true e
-        // shouldRun=false (true != true = false). Isso deixava bypass e o estado
-        // interno da chain dessincronizados, fazendo o checkbox nao ter efeito.
-        // Agora sempre sincronizamos os dois estados sem guarda.
+        // O Baseband NR e controlado exclusivamente pelo flag bypass dentro do
+        // run() de IFNRLogMMSE. Nao usamos mais togglePreprocessor() pois o
+        // chain.h tem um bug em blockBefore() que impede o re-enable correto.
+        // O processador fica sempre na chain; bypass=true faz passthrough limpo.
         bool shouldRun = enabled && ifnr;
         ifnrProcessor.bypass = !shouldRun;
-        sigpath::iqFrontEnd.togglePreprocessor(&ifnrProcessor, shouldRun);
     }
 
     void menuHandler() {
@@ -255,7 +260,7 @@ private:
             }
         }
 
-        // Checkboxes Audio NR (logmmse) por instancia de radio
+        // Audio NR logmmse por instancia de radio
         for (auto& [k, v] : afnrProcessors) {
             if (ImGui::Checkbox(("Audio NR " + k + "##_radio_logmmse_nr_" + k).c_str(), &v->allowed)) {
                 actuateAFNR();
@@ -265,6 +270,7 @@ private:
             }
         }
 
+        // Audio NR2 OMLSA por instancia de radio
         for (auto [k, v] : afnrProcessors2) {
             if (ImGui::Checkbox(("Audio NR2 " + k + "##_radio_omlsa_nr_" + k).c_str(), &v->allowed)) {
                 actuateAFNR();
@@ -275,6 +281,7 @@ private:
             ImGui::SameLine();
             ImGui::Text("%0.01f", 32767.0 / v->scaled);
         }
+
         if (ImGui::Checkbox(("SNR Chart##_radio_logmmse_nr_" + name).c_str(), &snrChartWidget)) {
             config.acquire();
             config.conf["SNRChartWidget"] = snrChartWidget;
