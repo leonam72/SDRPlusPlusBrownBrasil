@@ -45,7 +45,7 @@ public:
         buckets.resize(NBUCKETS);
         memset(buckets.data(), 0, sizeof(int) * NBUCKETS);
         for(auto f : logFrame) {
-            int bucket = (int) (NBUCKETS * ((f - minn) / width));
+                            int bucket = std::min(NBUCKETS - 1, (int)(NBUCKETS * ((f - minn) / width)));
             buckets[bucket]++;
         }
         auto ix = std::max_element(buckets.begin(), buckets.end()) - buckets.begin();
