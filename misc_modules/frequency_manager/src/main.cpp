@@ -2,9 +2,11 @@
 #include <module.h>
 #include <gui/gui.h>
 #include <gui/style.h>
+#include <gui/dialogs/dialog_box.h>
 #include <signal_path/signal_path.h>
 #include <core.h>
 #include <radio_interface.h>
+#include <utils/freq_formatting.h>
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -284,8 +286,8 @@ private:
         demodModeListRev.clear();
         demodModeListTxt = "";
         for (auto m : radio->radioModes) {
-            demodModeList[m.second] = m.first;
-            demodModeListRev[m.first] = m.second;
+            demodModeList[(DemodID)m.second] = m.first;
+            demodModeListRev[m.first] = (DemodID)m.second;
             demodModeListTxt += m.first;
             demodModeListTxt += std::string("\0", 1);
         }
