@@ -14,8 +14,7 @@
 #include <radio_interface.h>
 #include "if_nr.h"
 #include "af_nr.h"
-
-using namespace ImGui;
+#include <gui/widgets/snr_meter.h>
 
 ConfigManager config;
 
@@ -26,6 +25,11 @@ SDRPP_MOD_INFO{
     /* Version:     */ 0, 1, 0,
     /* Max instances */ -1
 };
+
+// AFNROMLSA é o alias correto para AFNR_OMLSA_MCRA (nome real em af_nr.h)
+namespace dsp {
+    using AFNROMLSA = AFNR_OMLSA_MCRA;
+}
 
 class NRModule : public ModuleManager::Instance {
     dsp::IFNRLogMMSE ifnrProcessor;
@@ -41,12 +45,23 @@ public:
         if (config.conf.contains("SNRChartWidget")) snrChartWidget = config.conf["SNRChartWidget"];
         config.release(true);
         ifnrProcessor.setDisableCpuDeactivation(disableCpuDeactivation);
+        ImGui::onSNRMeterExtPoint.bindHandler(&snrMeterExtPointHandler);
+        snrMeterExtPointHandler.ctx = this;
+        snrMeterExtPointHandler.handler = [](ImGui::SNRMeterExtPoint extp, void* ctx) {
+            NRModule* _this = (NRModule*)ctx;
+            if (_this->enabled) {
+                _this->lastsnr.insert(_this->lastsnr.begin(), extp.lastDrawnValue);
+                if (_this->lastsnr.size() > NLASTSNR) _this->lastsnr.resize(NLASTSNR);
+                _this->postSnrLocation = extp.postSnrLocation;
+            }
+        };
         gui::menu.registerEntry(name, menuHandler, this, NULL);
         updateBindings();
         actuateIFNR();
     }
 
     ~NRModule() {
+        ImGui::onSNRMeterExtPoint.unbindHandler(&snrMeterExtPointHandler);
         gui::menu.removeEntry(name);
     }
 
@@ -105,16 +120,15 @@ private:
         actuateAFNR();
     }
 
-    // FIX #1 (Windows crash): usa instanceName em vez de 'name' (que é o módulo NR, não o rádio)
     void detachAFFromRadio(const std::string& instanceName) {
         if (afnrProcessors.find(instanceName) != afnrProcessors.end()) {
-            core::modComManager.callInterface(instanceName,          // ✅ CORRIGIDO: era 'name'
+            core::modComManager.callInterface(instanceName,
                 RADIO_IFACE_CMD_REMOVE_FROM_IFCHAIN,
                 afnrProcessors[instanceName].get(), NULL);
             afnrProcessors.erase(instanceName);
         }
         if (afnrProcessors2.find(instanceName) != afnrProcessors2.end()) {
-            core::modComManager.callInterface(instanceName,          // ✅ CORRIGIDO: era 'name'
+            core::modComManager.callInterface(instanceName,
                 RADIO_IFACE_CMD_REMOVE_FROM_AFCHAIN,
                 afnrProcessors2[instanceName].get(), NULL);
             afnrProcessors2.erase(instanceName);
@@ -132,17 +146,6 @@ private:
                 _this->drawSNRMeterAverages(gctx);
             };
 
-            ImGui::onSNRMeterExtPoint.bindHandler(&snrMeterExtPointHandler);
-            snrMeterExtPointHandler.ctx = this;
-            snrMeterExtPointHandler.handler = [](ImGui::SNRMeterExtPoint extp, void* ctx) {
-                NRModule* _this = (NRModule*)ctx;
-                if (_this->enabled) {
-                    _this->lastsnr.insert(_this->lastsnr.begin(), extp.lastDrawnValue);
-                    if (_this->lastsnr.size() > NLASTSNR) _this->lastsnr.resize(NLASTSNR);
-                    _this->postSnrLocation = extp.postSnrLocation;
-                }
-            };
-
             sigpath::iqFrontEnd.addPreprocessor(&ifnrProcessor, false);
 
             sigpath::sourceManager.onTuneChanged.bindHandler(&currentFrequencyChangedHandler);
@@ -153,9 +156,8 @@ private:
             };
 
             auto names = core::modComManager.findInterfaces("radio");
-            for (auto& name : names) { attachAFToRadio(name); }
+            for (auto& n : names) { attachAFToRadio(n); }
 
-            // FIX #2: handler de criação de instância configurado corretamente
             core::moduleManager.onInstanceCreated.bindHandler(&instanceCreatedHandler);
             instanceCreatedHandler.ctx = this;
             instanceCreatedHandler.handler = [](std::string v, void* ctx) {
@@ -168,13 +170,10 @@ private:
 
         } else {
             sigpath::iqFrontEnd.removePreprocessor(&ifnrProcessor);
-            ImGui::onSNRMeterExtPoint.unbindHandler(&snrMeterExtPointHandler);
             gui::mainWindow.onWaterfallDrawn.unbindHandler(&waterfallDrawnHandler);
-
-            // FIX #3: unbind do handler de criação ao desabilitar (evita callbacks fantasmas)
             core::moduleManager.onInstanceCreated.unbindHandler(&instanceCreatedHandler);
+            sigpath::sourceManager.onTuneChanged.unbindHandler(&currentFrequencyChangedHandler);
 
-            // FIX #1: detach de todos os rádios ao desabilitar
             std::vector<std::string> toDetach;
             for (auto& [k, v] : afnrProcessors) { toDetach.push_back(k); }
             for (auto& k : toDetach) { detachAFFromRadio(k); }
