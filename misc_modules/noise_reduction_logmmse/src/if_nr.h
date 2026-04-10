@@ -149,15 +149,13 @@ namespace dsp {
                 return -1;
             }
 
-            // FIX: bypass estava comentado -- o NR processava o sinal SEMPRE,
-            // mesmo quando desativado pelo usuario. Agora faz passthrough correto.
-            if (bypass) {
-                memcpy(out.writeBuf, _in->readBuf, count * sizeof(complex_t));
-                _in->flush();
-                if (!out.swap(count)) { return -1; }
-                return count;
-            }
-
+            //            if (bypass) {
+            //                memcpy(out.writeBuf, _in->readBuf, count * sizeof(complex_t));
+            //                _in->flush();
+            //                if (!out.swap(count)) { return -1; }
+            //                return count;
+            //            }
+            //
             runMMSE(_in, out);
             return count;
         }
