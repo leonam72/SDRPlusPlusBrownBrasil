@@ -145,6 +145,7 @@ void IQFrontEnd::setDCBlocking(bool enabled) {
 }
 
 void IQFrontEnd::setInvertIQ(bool enabled) {
+        _invertIQ = enabled;
     preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
 }
 
@@ -339,6 +340,8 @@ void IQFrontEnd::togglePreprocessor(dsp::Processor<dsp::complex_t, dsp::complex_
     } else {
         preproc.disableBlock(processor, [=](dsp::stream<dsp::complex_t>* out) { split.setInput(out); });
     }
+        // Fix issue #74: Reaplica estado do Invert IQ apos toggle do preprocessor
+        preproc.setBlockEnabled(&conjugate, _invertIQ, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
 }
 
 long long IQFrontEnd::getCurrentStreamTime() {
