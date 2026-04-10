@@ -105,9 +105,6 @@ private:
         core::modComManager.callInterface(instanceName, RADIO_IFACE_CMD_ENABLE_IN_AFCHAIN, afnromlsa.get(), NULL);
 
         config.acquire();
-        // FIX: default agora e true — na ausencia da chave no config, o NR ja inicia ativo.
-        // Antes o default era false, entao o processador era adicionado a chain mas nunca
-        // habilitado, resultando em NR sem efeito visivel mesmo com o modulo "ativo".
         bool afnr = true;
         int frequency = 10;
         if (config.conf.contains("AF_NRF_" + instanceName)) frequency = config.conf["AF_NRF_" + instanceName];
@@ -204,11 +201,14 @@ private:
     }
 
     void actuateIFNR() {
+        // FIX: a condicao de guarda anterior (bypass != !shouldRun) impedia que o
+        // togglePreprocessor fosse chamado na inicializacao quando bypass=true e
+        // shouldRun=false (true != true = false). Isso deixava bypass e o estado
+        // interno da chain dessincronizados, fazendo o checkbox nao ter efeito.
+        // Agora sempre sincronizamos os dois estados sem guarda.
         bool shouldRun = enabled && ifnr;
-        if (ifnrProcessor.bypass != !shouldRun) {
-            ifnrProcessor.bypass = !shouldRun;
-            sigpath::iqFrontEnd.togglePreprocessor(&ifnrProcessor, shouldRun);
-        }
+        ifnrProcessor.bypass = !shouldRun;
+        sigpath::iqFrontEnd.togglePreprocessor(&ifnrProcessor, shouldRun);
     }
 
     void menuHandler() {
