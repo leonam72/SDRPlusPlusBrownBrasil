@@ -410,7 +410,7 @@ private:
                 rtlsdr_set_direct_sampling(_this->openDev, _this->directSamplingMode);
 
                 // Update gains (fix for librtlsdr bug)
-                if (_this->directSamplingMode == false) {
+                if (_this->directSamplingMode == 0) {
                     rtlsdr_set_agc_mode(_this->openDev, _this->rtlAgc);
                     if (_this->tunerAgc) {
                         rtlsdr_set_tuner_gain_mode(_this->openDev, 0);
