@@ -26,7 +26,6 @@ SDRPP_MOD_INFO{
     /* Max instances */ -1
 };
 
-// AFNROMLSA é o alias correto para AFNR_OMLSA_MCRA (nome real em af_nr.h)
 namespace dsp {
     using AFNROMLSA = AFNR_OMLSA_MCRA;
 }
@@ -106,10 +105,14 @@ private:
         core::modComManager.callInterface(instanceName, RADIO_IFACE_CMD_ENABLE_IN_AFCHAIN, afnromlsa.get(), NULL);
 
         config.acquire();
-        bool afnr = false;
-        auto frequency = 10;
+        // FIX: default agora e true — na ausencia da chave no config, o NR ja inicia ativo.
+        // Antes o default era false, entao o processador era adicionado a chain mas nunca
+        // habilitado, resultando em NR sem efeito visivel mesmo com o modulo "ativo".
+        bool afnr = true;
+        int frequency = 10;
         if (config.conf.contains("AF_NRF_" + instanceName)) frequency = config.conf["AF_NRF_" + instanceName];
-        bool afnr2 = false;
+        bool afnr2 = true;
+        if (config.conf.contains("AF_NR_" + instanceName))  afnr  = config.conf["AF_NR_"  + instanceName];
         if (config.conf.contains("AF_NR2_" + instanceName)) afnr2 = config.conf["AF_NR2_" + instanceName];
         config.release(true);
 
@@ -251,6 +254,17 @@ private:
                 if (ifnrProcessor.percentUsage > 80) { ImGui::PopStyleColor(1); }
             }
         }
+
+        // Checkboxes Audio NR (logmmse) por instancia de radio
+        for (auto& [k, v] : afnrProcessors) {
+            if (ImGui::Checkbox(("Audio NR " + k + "##_radio_logmmse_nr_" + k).c_str(), &v->allowed)) {
+                actuateAFNR();
+                config.acquire();
+                config.conf["AF_NR_" + k] = v->allowed;
+                config.release(true);
+            }
+        }
+
         for (auto [k, v] : afnrProcessors2) {
             if (ImGui::Checkbox(("Audio NR2 " + k + "##_radio_omlsa_nr_" + k).c_str(), &v->allowed)) {
                 actuateAFNR();
