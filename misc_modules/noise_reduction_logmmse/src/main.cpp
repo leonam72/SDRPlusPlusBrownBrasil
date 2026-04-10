@@ -26,304 +26,302 @@ SDRPP_MOD_INFO{
     /* Max instances */ -1
 };
 
-namespace dsp {
-    using AFNROMLSA = AFNR_OMLSA_MCRA;
-}
-
 class NRModule : public ModuleManager::Instance {
     dsp::IFNRLogMMSE ifnrProcessor;
-    std::unordered_map<std::string, std::shared_ptr<dsp::AFNRLogMMSE>> afnrProcessors;
-    std::unordered_map<std::string, std::shared_ptr<dsp::AFNROMLSA>> afnrProcessors2;
+    std::unordered_map<std::string, std::shared_ptr<dsp::AFNRLogMMSE>>    afnrProcessors;   // logmmse por radio
+    std::unordered_map<std::string, std::shared_ptr<dsp::AFNR_OMLSA_MCRA>> afnrProcessors2; // omlsa por radio
+
+    // controla se ifnrProcessor ja foi inserido na preproc chain
+    bool ifnrAdded = false;
 
 public:
     NRModule(std::string name) {
         this->name = name;
+
         config.acquire();
-        if (config.conf.contains("IFNR")) ifnr = config.conf["IFNR"];
+        if (config.conf.contains("IFNR"))                  ifnr                  = config.conf["IFNR"];
         if (config.conf.contains("DisableCpuDeactivation")) disableCpuDeactivation = config.conf["DisableCpuDeactivation"];
-        if (config.conf.contains("SNRChartWidget")) snrChartWidget = config.conf["SNRChartWidget"];
+        if (config.conf.contains("SNRChartWidget"))         snrChartWidget         = config.conf["SNRChartWidget"];
         config.release(true);
+
         ifnrProcessor.setDisableCpuDeactivation(disableCpuDeactivation);
+
+        // SNR meter handler — registrado uma unica vez, para sempre
         ImGui::onSNRMeterExtPoint.bindHandler(&snrMeterExtPointHandler);
         snrMeterExtPointHandler.ctx = this;
         snrMeterExtPointHandler.handler = [](ImGui::SNRMeterExtPoint extp, void* ctx) {
             NRModule* _this = (NRModule*)ctx;
-            if (_this->enabled) {
-                _this->lastsnr.insert(_this->lastsnr.begin(), extp.lastDrawnValue);
-                if (_this->lastsnr.size() > NLASTSNR) _this->lastsnr.resize(NLASTSNR);
-                _this->postSnrLocation = extp.postSnrLocation;
-            }
+            if (!_this->enabled) return;
+            _this->lastsnr.insert(_this->lastsnr.begin(), extp.lastDrawnValue);
+            if (_this->lastsnr.size() > NLASTSNR) _this->lastsnr.resize(NLASTSNR);
+            _this->postSnrLocation = extp.postSnrLocation;
         };
+
         gui::menu.registerEntry(name, menuHandler, this, NULL);
-        updateBindings();
-        // FIX: nao chamamos mais actuateIFNR() aqui porque addPreprocessor ja
-        // insere o processador com bypass=true (desativado por padrao). O bypass
-        // e controlado diretamente no run() de IFNRLogMMSE.
+
+        // Insere o processador na chain UMA UNICA VEZ com enabled=true.
+        // O bypass dentro de run() controla se processa ou faz passthrough.
+        // Nunca chamamos removePreprocessor/addPreprocessor novamente para
+        // evitar o crash de "block already part of chain" no chain.h.
+        sigpath::iqFrontEnd.addPreprocessor(&ifnrProcessor, true);
+        ifnrAdded = true;
+
+        // Aplica o estado inicial do bypass baseado no config carregado
         actuateIFNR();
+
+        // Registra os handlers de UI e radio (tune, radio instances)
+        bindEventHandlers();
     }
 
     ~NRModule() {
         ImGui::onSNRMeterExtPoint.unbindHandler(&snrMeterExtPointHandler);
         gui::menu.removeEntry(name);
+        unbindEventHandlers();
+        if (ifnrAdded) {
+            sigpath::iqFrontEnd.removePreprocessor(&ifnrProcessor);
+        }
     }
 
     void postInit() {}
 
     void enable() {
-        if (!enabled) {
-            enabled = true;
-            ifnrProcessor.setDisableCpuDeactivation(disableCpuDeactivation);
-            updateBindings();
-            actuateIFNR();
-        }
+        if (enabled) return;
+        enabled = true;
+        ifnrProcessor.setDisableCpuDeactivation(disableCpuDeactivation);
+        actuateIFNR();       // aplica bypass conforme estado do checkbox
+        bindEventHandlers(); // reconecta tune/radio handlers
     }
 
     void disable() {
-        if (enabled) {
-            enabled = false;
-            actuateIFNR();
-            updateBindings();
-        }
+        if (!enabled) return;
+        enabled = false;
+        // forcamos bypass=true quando o modulo inteiro esta desabilitado
+        ifnrProcessor.bypass = true;
+        unbindEventHandlers();
     }
 
     bool isEnabled() { return enabled; }
 
 private:
-    bool ifnr = false;
+    bool ifnr                  = false;
     bool disableCpuDeactivation = false;
-    bool afnrEnabled = false;
-    bool snrChartWidget = false;
+    bool snrChartWidget        = false;
+    bool handlersbound         = false;
 
-    void attachAFToRadio(const std::string& instanceName) {
-        auto afnrlogmmse = std::make_shared<dsp::AFNRLogMMSE>();
-        afnrProcessors[instanceName] = afnrlogmmse;
-        afnrlogmmse->init(nullptr);
+    // -----------------------------------------------------------------------
+    // Bind / unbind dos handlers de eventos (tune + radio instances)
+    // Chamado apenas quando o modulo esta enabled.
+    // -----------------------------------------------------------------------
+    void bindEventHandlers() {
+        if (handlersbound) return;
+        handlersbound = true;
 
-        const std::shared_ptr<dsp::AFNROMLSA> afnromlsa = std::make_shared<dsp::AFNROMLSA>();
-        afnromlsa->init(nullptr);
-        afnrProcessors2[instanceName] = afnromlsa;
+        gui::mainWindow.onWaterfallDrawn.bindHandler(&waterfallDrawnHandler);
+        waterfallDrawnHandler.ctx = this;
+        waterfallDrawnHandler.handler = [](ImGuiContext* gctx, void* ctx) {
+            ((NRModule*)ctx)->drawSNRMeterAverages(gctx);
+        };
 
-        core::modComManager.callInterface(instanceName, RADIO_IFACE_CMD_ADD_TO_IFCHAIN, afnrlogmmse.get(), NULL);
-        core::modComManager.callInterface(instanceName, RADIO_IFACE_CMD_ADD_TO_AFCHAIN, afnromlsa.get(), NULL);
-        core::modComManager.callInterface(instanceName, RADIO_IFACE_CMD_ENABLE_IN_AFCHAIN, afnromlsa.get(), NULL);
+        sigpath::sourceManager.onTuneChanged.bindHandler(&currentFrequencyChangedHandler);
+        currentFrequencyChangedHandler.ctx = this;
+        currentFrequencyChangedHandler.handler = [](double, void* ctx) {
+            ((NRModule*)ctx)->ifnrProcessor.reset();
+        };
+
+        // anexa AF NR em todos os radios ja existentes
+        auto names = core::modComManager.findInterfaces("radio");
+        for (auto& n : names) { attachAFToRadio(n); }
+
+        core::moduleManager.onInstanceCreated.bindHandler(&instanceCreatedHandler);
+        instanceCreatedHandler.ctx = this;
+        instanceCreatedHandler.handler = [](std::string v, void* ctx) {
+            auto _this = (NRModule*)ctx;
+            if (core::moduleManager.getInstanceModuleName(v) == "radio")
+                _this->attachAFToRadio(v);
+        };
+    }
+
+    void unbindEventHandlers() {
+        if (!handlersbound) return;
+        handlersbound = false;
+
+        gui::mainWindow.onWaterfallDrawn.unbindHandler(&waterfallDrawnHandler);
+        sigpath::sourceManager.onTuneChanged.unbindHandler(&currentFrequencyChangedHandler);
+        core::moduleManager.onInstanceCreated.unbindHandler(&instanceCreatedHandler);
+
+        // desanexa AF NR de todos os radios
+        std::vector<std::string> toDetach;
+        for (auto& [k, _] : afnrProcessors) toDetach.push_back(k);
+        for (auto& k : toDetach) detachAFFromRadio(k);
+    }
+
+    // -----------------------------------------------------------------------
+    // AF NR attachment
+    // -----------------------------------------------------------------------
+    void attachAFToRadio(const std::string& inst) {
+        // evita duplo attach
+        if (afnrProcessors.count(inst)) return;
+
+        auto logmmse = std::make_shared<dsp::AFNRLogMMSE>();
+        logmmse->init(nullptr);
+        afnrProcessors[inst] = logmmse;
+
+        auto omlsa = std::make_shared<dsp::AFNR_OMLSA_MCRA>();
+        omlsa->init(nullptr);
+        afnrProcessors2[inst] = omlsa;
+
+        // logmmse vai para a IF chain do radio
+        core::modComManager.callInterface(inst, RADIO_IFACE_CMD_ADD_TO_IFCHAIN,  logmmse.get(), NULL);
+        // omlsa vai para a AF chain do radio
+        core::modComManager.callInterface(inst, RADIO_IFACE_CMD_ADD_TO_AFCHAIN,  omlsa.get(), NULL);
+        core::modComManager.callInterface(inst, RADIO_IFACE_CMD_ENABLE_IN_AFCHAIN, omlsa.get(), NULL);
 
         config.acquire();
-        bool afnr = false;
-        int frequency = 10;
-        if (config.conf.contains("AF_NRF_" + instanceName)) frequency = config.conf["AF_NRF_" + instanceName];
-        bool afnr2 = false;
-        if (config.conf.contains("AF_NR_" + instanceName))  afnr  = config.conf["AF_NR_"  + instanceName];
-        if (config.conf.contains("AF_NR2_" + instanceName)) afnr2 = config.conf["AF_NR2_" + instanceName];
+        int  freq  = 10;    if (config.conf.contains("AF_NRF_" + inst))  freq  = config.conf["AF_NRF_" + inst];
+        bool afnr  = false; if (config.conf.contains("AF_NR_"  + inst))  afnr  = config.conf["AF_NR_"  + inst];
+        bool afnr2 = false; if (config.conf.contains("AF_NR2_" + inst))  afnr2 = config.conf["AF_NR2_" + inst];
         config.release(true);
 
-        afnrlogmmse->afnrBandwidth = frequency;
-        afnrlogmmse->setProcessingBandwidth(frequency * 1000);
-        afnrlogmmse->allowed = afnr;
-        afnromlsa->allowed = afnr2;
+        logmmse->afnrBandwidth = freq;
+        logmmse->setProcessingBandwidth(freq * 1000);
+        logmmse->allowed = afnr;
+        omlsa->allowed   = afnr2;
+
         actuateAFNR();
     }
 
-    void detachAFFromRadio(const std::string& instanceName) {
-        if (afnrProcessors.find(instanceName) != afnrProcessors.end()) {
-            core::modComManager.callInterface(instanceName,
-                RADIO_IFACE_CMD_REMOVE_FROM_IFCHAIN,
-                afnrProcessors[instanceName].get(), NULL);
-            afnrProcessors.erase(instanceName);
+    void detachAFFromRadio(const std::string& inst) {
+        auto it1 = afnrProcessors.find(inst);
+        if (it1 != afnrProcessors.end()) {
+            core::modComManager.callInterface(inst, RADIO_IFACE_CMD_REMOVE_FROM_IFCHAIN, it1->second.get(), NULL);
+            afnrProcessors.erase(it1);
         }
-        if (afnrProcessors2.find(instanceName) != afnrProcessors2.end()) {
-            core::modComManager.callInterface(instanceName,
-                RADIO_IFACE_CMD_REMOVE_FROM_AFCHAIN,
-                afnrProcessors2[instanceName].get(), NULL);
-            afnrProcessors2.erase(instanceName);
+        auto it2 = afnrProcessors2.find(inst);
+        if (it2 != afnrProcessors2.end()) {
+            core::modComManager.callInterface(inst, RADIO_IFACE_CMD_REMOVE_FROM_AFCHAIN, it2->second.get(), NULL);
+            afnrProcessors2.erase(it2);
         }
     }
 
-    void updateBindings() {
-        if (enabled) {
-            flog::info("Enabling noise reduction things");
+    // -----------------------------------------------------------------------
+    // Actuation
+    // -----------------------------------------------------------------------
 
-            gui::mainWindow.onWaterfallDrawn.bindHandler(&waterfallDrawnHandler);
-            waterfallDrawnHandler.ctx = this;
-            waterfallDrawnHandler.handler = [](ImGuiContext* gctx, void* ctx) {
-                NRModule* _this = (NRModule*)ctx;
-                _this->drawSNRMeterAverages(gctx);
-            };
-
-            // FIX: inserimos o processador SEMPRE habilitado na chain (enabled=true).
-            // O controle de ativo/inativo e feito pelo bypass dentro do run() de
-            // IFNRLogMMSE, evitando o bug de blockBefore() no chain.h que impedia
-            // o re-enable apos um disable via togglePreprocessor.
-            sigpath::iqFrontEnd.addPreprocessor(&ifnrProcessor, true);
-
-            sigpath::sourceManager.onTuneChanged.bindHandler(&currentFrequencyChangedHandler);
-            currentFrequencyChangedHandler.ctx = this;
-            currentFrequencyChangedHandler.handler = [](double v, void* ctx) {
-                auto _this = (NRModule*)ctx;
-                _this->ifnrProcessor.reset();
-            };
-
-            auto names = core::modComManager.findInterfaces("radio");
-            for (auto& n : names) { attachAFToRadio(n); }
-
-            core::moduleManager.onInstanceCreated.bindHandler(&instanceCreatedHandler);
-            instanceCreatedHandler.ctx = this;
-            instanceCreatedHandler.handler = [](std::string v, void* ctx) {
-                auto _this = (NRModule*)ctx;
-                auto modname = core::moduleManager.getInstanceModuleName(v);
-                if (modname == "radio") {
-                    _this->attachAFToRadio(v);
-                }
-            };
-
-        } else {
-            sigpath::iqFrontEnd.removePreprocessor(&ifnrProcessor);
-            gui::mainWindow.onWaterfallDrawn.unbindHandler(&waterfallDrawnHandler);
-            core::moduleManager.onInstanceCreated.unbindHandler(&instanceCreatedHandler);
-            sigpath::sourceManager.onTuneChanged.unbindHandler(&currentFrequencyChangedHandler);
-
-            std::vector<std::string> toDetach;
-            for (auto& [k, v] : afnrProcessors) { toDetach.push_back(k); }
-            for (auto& k : toDetach) { detachAFFromRadio(k); }
-        }
-    }
-
-    std::unordered_map<std::string, int64_t> firstTimeHover;
-    bool mustShowTooltip(const std::string& key) {
-        if (ImGui::IsItemHovered()) {
-            auto what = firstTimeHover[key];
-            if (what == 0) { firstTimeHover[key] = currentTimeMillis(); return false; }
-            else { return currentTimeMillis() - what > 1000; }
-        } else {
-            firstTimeHover[key] = 0;
-            return false;
-        }
-    }
-
-    void actuateAFNR() {
-        for (auto [k, v] : afnrProcessors) {
-            core::modComManager.callInterface(k,
-                !v->allowed ? RADIO_IFACE_CMD_DISABLE_IN_IFCHAIN : RADIO_IFACE_CMD_ENABLE_IN_IFCHAIN,
-                v.get(), NULL);
-        }
-    }
-
+    // Baseband NR: apenas altera o flag bypass — o processador permanece
+    // sempre ativo na chain para evitar o bug de blockBefore() no chain.h
     void actuateIFNR() {
-        // O Baseband NR e controlado exclusivamente pelo flag bypass dentro do
-        // run() de IFNRLogMMSE. Nao usamos mais togglePreprocessor() pois o
-        // chain.h tem um bug em blockBefore() que impede o re-enable correto.
-        // O processador fica sempre na chain; bypass=true faz passthrough limpo.
-        bool shouldRun = enabled && ifnr;
-        ifnrProcessor.bypass = !shouldRun;
+        ifnrProcessor.bypass = !(enabled && ifnr);
     }
 
+    // AF NR logmmse: enable/disable na IF chain do radio
+    void actuateAFNR() {
+        for (auto& [k, v] : afnrProcessors) {
+            int cmd = v->allowed ? RADIO_IFACE_CMD_ENABLE_IN_IFCHAIN
+                                 : RADIO_IFACE_CMD_DISABLE_IN_IFCHAIN;
+            core::modComManager.callInterface(k, cmd, v.get(), NULL);
+        }
+        // OMLSA (afnrProcessors2) e controlado pelo campo allowed lido
+        // diretamente pelo processador; nao precisa de cmd separado.
+    }
+
+    // -----------------------------------------------------------------------
+    // Menu
+    // -----------------------------------------------------------------------
     void menuHandler() {
-        float menuWidth = ImGui::GetContentRegionAvail().x;
+        // --- Baseband NR ---
         if (ImGui::Checkbox("Baseband NR##_sdrpp_if_nr", &ifnr)) {
             config.acquire();
             config.conf["IFNR"] = ifnr;
             config.release(true);
-            if (ifnr) { ifnrProcessor.stopReason = ""; }
+            if (ifnr) ifnrProcessor.stopReason = "";
             actuateIFNR();
         }
         ImGui::SameLine();
+
+        // se o processador pediu parada por CPU, reflete no checkbox
         if (ifnrProcessor.stopReason != "" && ifnr) {
             ifnr = false;
-            config.acquire();
-            config.conf["IFNR"] = ifnr;
-            config.release(true);
+            config.acquire(); config.conf["IFNR"] = ifnr; config.release(true);
             actuateIFNR();
         }
+
         if (ifnrProcessor.stopReason != "") {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0, 0, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0,0,1));
             ImGui::Text("%s", ifnrProcessor.stopReason.c_str());
-            ImGui::PopStyleColor(1);
-        } else {
-            if (ifnrProcessor.percentUsage >= 0) {
-                if (ifnrProcessor.percentUsage > 80) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0, 0, 1.0f)); }
-                std::string cpuText = std::to_string((int)ifnrProcessor.percentUsage) + "% cpu";
-                ImVec2 textSize = ImGui::CalcTextSize(cpuText.c_str());
-                bool clicked = ImGui::Selectable(cpuText.c_str(), false, ImGuiSelectableFlags_None, textSize);
-                if (clicked) {
-                    disableCpuDeactivation = !disableCpuDeactivation;
-                    ifnrProcessor.setDisableCpuDeactivation(disableCpuDeactivation);
-                    config.acquire();
-                    config.conf["DisableCpuDeactivation"] = disableCpuDeactivation;
-                    config.release(true);
-                }
-                if (disableCpuDeactivation) {
-                    auto drawList = ImGui::GetWindowDrawList();
-                    ImVec2 min = ImGui::GetItemRectMin();
-                    ImVec2 max = ImGui::GetItemRectMax();
-                    drawList->AddLine(ImVec2(min.x, (min.y + max.y) / 2), ImVec2(max.x, (min.y + max.y) / 2), ImGui::GetColorU32(ImGuiCol_Text), 1.0f);
-                }
-                if (ifnrProcessor.percentUsage > 80) { ImGui::PopStyleColor(1); }
+            ImGui::PopStyleColor();
+        } else if (ifnrProcessor.percentUsage >= 0) {
+            if (ifnrProcessor.percentUsage > 80) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0,0,1));
+            std::string cpu = std::to_string((int)ifnrProcessor.percentUsage) + "% cpu";
+            ImVec2 sz = ImGui::CalcTextSize(cpu.c_str());
+            if (ImGui::Selectable(cpu.c_str(), false, ImGuiSelectableFlags_None, sz)) {
+                disableCpuDeactivation = !disableCpuDeactivation;
+                ifnrProcessor.setDisableCpuDeactivation(disableCpuDeactivation);
+                config.acquire(); config.conf["DisableCpuDeactivation"] = disableCpuDeactivation; config.release(true);
             }
+            if (disableCpuDeactivation) {
+                auto dl = ImGui::GetWindowDrawList();
+                ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+                dl->AddLine({mn.x,(mn.y+mx.y)/2}, {mx.x,(mn.y+mx.y)/2}, ImGui::GetColorU32(ImGuiCol_Text));
+            }
+            if (ifnrProcessor.percentUsage > 80) ImGui::PopStyleColor();
         }
 
-        // Audio NR logmmse por instancia de radio
+        // --- Audio NR (logmmse) por radio ---
         for (auto& [k, v] : afnrProcessors) {
-            if (ImGui::Checkbox(("Audio NR " + k + "##_radio_logmmse_nr_" + k).c_str(), &v->allowed)) {
+            if (ImGui::Checkbox(("Audio NR " + k + "##_af_logmmse_" + k).c_str(), &v->allowed)) {
                 actuateAFNR();
-                config.acquire();
-                config.conf["AF_NR_" + k] = v->allowed;
-                config.release(true);
+                config.acquire(); config.conf["AF_NR_" + k] = v->allowed; config.release(true);
             }
         }
 
-        // Audio NR2 OMLSA por instancia de radio
-        for (auto [k, v] : afnrProcessors2) {
-            if (ImGui::Checkbox(("Audio NR2 " + k + "##_radio_omlsa_nr_" + k).c_str(), &v->allowed)) {
-                actuateAFNR();
-                config.acquire();
-                config.conf["AF_NR2_" + k] = v->allowed;
-                config.release(true);
+        // --- Audio NR2 (OMLSA) por radio ---
+        for (auto& [k, v] : afnrProcessors2) {
+            if (ImGui::Checkbox(("Audio NR2 " + k + "##_af_omlsa_" + k).c_str(), &v->allowed)) {
+                config.acquire(); config.conf["AF_NR2_" + k] = v->allowed; config.release(true);
             }
             ImGui::SameLine();
             ImGui::Text("%0.01f", 32767.0 / v->scaled);
         }
 
-        if (ImGui::Checkbox(("SNR Chart##_radio_logmmse_nr_" + name).c_str(), &snrChartWidget)) {
-            config.acquire();
-            config.conf["SNRChartWidget"] = snrChartWidget;
-            config.release(true);
+        // --- SNR Chart ---
+        if (ImGui::Checkbox(("SNR Chart##_snr_" + name).c_str(), &snrChartWidget)) {
+            config.acquire(); config.conf["SNRChartWidget"] = snrChartWidget; config.release(true);
         }
     }
 
-    static void menuHandler(void* ctx) {
-        NRModule* _this = (NRModule*)ctx;
-        _this->menuHandler();
-    }
+    static void menuHandler(void* ctx) { ((NRModule*)ctx)->menuHandler(); }
 
+    // -----------------------------------------------------------------------
+    // SNR chart overlay
+    // -----------------------------------------------------------------------
     static const int NLASTSNR = 1500;
     std::vector<float> lastsnr;
     ImVec2 postSnrLocation;
 
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "UnreachableCode"
     void drawSNRMeterAverages(ImGuiContext* gctx) {
-        if (!snrChartWidget || !enabled) { return; }
+        if (!snrChartWidget || !enabled) return;
         static std::vector<float> r;
         static int counter = 0;
         static const int winsize = 10;
-        counter++;
-        if (counter % winsize == winsize - 1) { r = dsp::math::maxeach(winsize, lastsnr); }
-        ImGuiWindow* window = gctx->CurrentWindow;
-        ImU32 text = ImGui::GetColorU32(ImGuiCol_Text);
-        for (int q = 1; q < (int)r.size(); q++) {
-            window->DrawList->AddLine(
-                postSnrLocation + ImVec2(0 + r[q - 1], q - 1 + window->Pos.y),
-                postSnrLocation + ImVec2(0 + r[q], q + window->Pos.y),
-                text);
-        }
+        if (++counter % winsize == winsize - 1)
+            r = dsp::math::maxeach(winsize, lastsnr);
+        ImGuiWindow* w = gctx->CurrentWindow;
+        ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+        for (int q = 1; q < (int)r.size(); q++)
+            w->DrawList->AddLine(
+                postSnrLocation + ImVec2(r[q-1], (float)(q-1) + w->Pos.y),
+                postSnrLocation + ImVec2(r[q],   (float)q     + w->Pos.y), col);
     }
-#pragma clang diagnostic pop
 
+    // -----------------------------------------------------------------------
+    // Members
+    // -----------------------------------------------------------------------
     std::string name;
     bool enabled = true;
-    EventHandler<ImGuiContext*> waterfallDrawnHandler;
+    EventHandler<ImGuiContext*>          waterfallDrawnHandler;
     EventHandler<ImGui::SNRMeterExtPoint> snrMeterExtPointHandler;
-    EventHandler<double> currentFrequencyChangedHandler;
-    EventHandler<std::string> instanceCreatedHandler;
+    EventHandler<double>                 currentFrequencyChangedHandler;
+    EventHandler<std::string>            instanceCreatedHandler;
 };
 
 MOD_EXPORT void _INIT_() {
@@ -331,7 +329,6 @@ MOD_EXPORT void _INIT_() {
     config.load(json::object());
     config.enableAutoSave();
 }
-
 MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) { return new NRModule(name); }
 MOD_EXPORT void _DELETE_INSTANCE_(void* instance) { delete (NRModule*)instance; }
 MOD_EXPORT void _END_() { config.disableAutoSave(); config.save(); }
