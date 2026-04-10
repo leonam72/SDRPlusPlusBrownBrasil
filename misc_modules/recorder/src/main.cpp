@@ -47,12 +47,10 @@ public:
 
         // Define option lists
         containers.define("WAV", wav::FORMAT_WAV);
-        // containers.define("RF64", wav::FORMAT_RF64); // Disabled for now
         sampleTypes.define(wav::SAMP_TYPE_UINT8, "Uint8", wav::SAMP_TYPE_UINT8);
         sampleTypes.define(wav::SAMP_TYPE_INT16, "Int16", wav::SAMP_TYPE_INT16);
         sampleTypes.define(wav::SAMP_TYPE_INT32, "Int32", wav::SAMP_TYPE_INT32);
         sampleTypes.define(wav::SAMP_TYPE_FLOAT32, "Float32", wav::SAMP_TYPE_FLOAT32);
-
 
         // Load default config for option lists
         containerId = containers.valueId(wav::FORMAT_WAV);
@@ -122,14 +120,12 @@ public:
     }
 
     void postInit() {
-        // Enumerate streams
         audioStreams.clear();
         auto names = sigpath::sinkManager.getStreamNames();
         for (const auto& name : names) {
             audioStreams.define(name, name, name);
         }
 
-        // Bind stream register/unregister handlers
         onStreamRegisteredHandler.ctx = this;
         onStreamRegisteredHandler.handler = streamRegisteredHandler;
         sigpath::sinkManager.onStreamRegistered.bindHandler(&onStreamRegisteredHandler);
@@ -137,7 +133,6 @@ public:
         onStreamUnregisterHandler.handler = streamUnregisterHandler;
         sigpath::sinkManager.onStreamUnregister.bindHandler(&onStreamUnregisterHandler);
 
-        // Select the stream
         selectStream(selectedStreamName);
     }
 
@@ -157,7 +152,6 @@ public:
         std::lock_guard<std::recursive_mutex> lck(recMtx);
         if (recording) { return; }
 
-        // Configure the wav writer
         if (recMode == RECORDER_MODE_AUDIO) {
             if (selectedStreamName.empty()) { return; }
             samplerate = sigpath::sinkManager.getStreamSampleRate(selectedStreamName);
@@ -165,12 +159,18 @@ public:
         else {
             samplerate = sigpath::iqFrontEnd.getSampleRate();
         }
+
+        // BUG3 FIX: guard against division by zero in time display
+        if (samplerate == 0) {
+            flog::error("Recorder: samplerate is 0, refusing to start");
+            return;
+        }
+
         writer.setFormat(containers[containerId]);
         writer.setChannels((recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2);
         writer.setSampleType(sampleTypes[sampleTypeId]);
         writer.setSamplerate(samplerate);
 
-        // Open file
         std::string vfoName = (recMode == RECORDER_MODE_AUDIO) ? selectedStreamName : "";
         std::string extension = ".wav";
         std::string expandedPath = expandString(folderSelect.path + "/" + genFileName(nameTemplate, recMode, vfoName) + extension);
@@ -179,9 +179,7 @@ public:
             return;
         }
 
-        // Open audio stream or baseband
         if (recMode == RECORDER_MODE_AUDIO) {
-            // Start correct path depending on stereo mode
             if (stereo) {
                 stereoSink.start();
             }
@@ -192,7 +190,7 @@ public:
             splitter.bindStream(&stereoStream);
         }
         else {
-            // Create and bind IQ stream
+            // BUG1 FIX: basebandStream is always nullptr here (initialized below), safe
             basebandStream = new dsp::stream<dsp::complex_t>();
             basebandSink.setInput(basebandStream);
             basebandSink.start();
@@ -206,10 +204,8 @@ public:
         std::lock_guard<std::recursive_mutex> lck(recMtx);
         if (!recording) { return; }
 
-        // Close audio stream or baseband
         if (recMode == RECORDER_MODE_AUDIO) {
             splitter.unbindStream(&stereoStream);
-            // FIX: only stop the path that was actually started
             if (stereo) {
                 stereoSink.stop();
             }
@@ -219,15 +215,16 @@ public:
             }
         }
         else {
-            // Unbind and destroy IQ stream
-            sigpath::iqFrontEnd.unbindIQStream(basebandStream);
-            basebandSink.stop();
-            delete basebandStream;
+            // BUG1 FIX: only access basebandStream if non-null
+            if (basebandStream != nullptr) {
+                sigpath::iqFrontEnd.unbindIQStream(basebandStream);
+                basebandSink.stop();
+                delete basebandStream;
+                basebandStream = nullptr;
+            }
         }
 
-        // Close file
         writer.close();
-        
         recording = false;
     }
 
@@ -236,7 +233,6 @@ private:
         RecorderModule* _this = (RecorderModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
 
-        // Recording mode
         if (_this->recording) { style::beginDisabled(); }
         ImGui::BeginGroup();
         ImGui::Columns(2, CONCAT("RecorderModeColumns##_", _this->name), false);
@@ -256,7 +252,6 @@ private:
         ImGui::Columns(1, CONCAT("EndRecorderModeColumns##_", _this->name), false);
         ImGui::EndGroup();
 
-        // Recording path
         if (_this->folderSelect.render("##_recorder_fold_" + _this->name)) {
             if (_this->folderSelect.pathIsValid()) {
                 config.acquire();
@@ -291,7 +286,6 @@ private:
 
         if (_this->recording) { style::endDisabled(); }
 
-        // Show additional audio options
         if (_this->recMode == RECORDER_MODE_AUDIO) {
             if (_this->recording) { style::beginDisabled(); }
             ImGui::LeftLabel("Stream");
@@ -333,11 +327,9 @@ private:
             }
         }
 
-        // Record button
         bool canRecord = _this->folderSelect.pathIsValid();
         if (_this->recMode == RECORDER_MODE_AUDIO) { canRecord &= !_this->selectedStreamName.empty(); }
         if (!_this->recording) {
-            // FIX: disable the Record button when canRecord is false
             if (!canRecord) { style::beginDisabled(); }
             if (ImGui::Button(CONCAT("Record##_recorder_rec_", _this->name), ImVec2(menuWidth, 0))) {
                 _this->start();
@@ -349,9 +341,13 @@ private:
             if (ImGui::Button(CONCAT("Stop##_recorder_rec_", _this->name), ImVec2(menuWidth, 0))) {
                 _this->stop();
             }
+            // BUG3 FIX: samplerate already guaranteed != 0 by start() guard
             uint64_t seconds = _this->writer.getSamplesWritten() / _this->samplerate;
-            time_t diff = seconds;
-            tm* dtm = gmtime(&diff);
+            time_t diff = (time_t)seconds;
+
+            // BUG2 FIX: gmtime() is not thread-safe — use gmtime_r() with local buffer
+            struct tm dtm_buf;
+            struct tm* dtm = gmtime_r(&diff, &dtm_buf);
 
             if (_this->ignoreSilence && _this->ignoringSilence) {
                 ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Paused %02d:%02d:%02d", dtm->tm_hour, dtm->tm_min, dtm->tm_sec);
@@ -411,11 +407,7 @@ private:
 
     static void streamRegisteredHandler(std::string name, void* ctx) {
         RecorderModule* _this = (RecorderModule*)ctx;
-
-        // Add new stream to the list
         _this->audioStreams.define(name, name, name);
-
-        // If no stream is selected, select new stream. If not, update the menu ID. 
         if (_this->selectedStreamName.empty()) {
             _this->selectStream(name);
         }
@@ -426,21 +418,22 @@ private:
 
     static void streamUnregisterHandler(std::string name, void* ctx) {
         RecorderModule* _this = (RecorderModule*)ctx;
-
-        // Remove stream from list
         _this->audioStreams.undefineKey(name);
-
-        // If the stream is in used, deselect it and reselect default. Otherwise, update ID.
         if (_this->selectedStreamName == name) {
             _this->selectStream("");
         }
         else {
-            _this->streamId = _this->audioStreams.keyId(_this->selectedStreamName);
+            // BUG4 FIX: only call keyId if key still exists after removal
+            if (!_this->selectedStreamName.empty() && _this->audioStreams.keyExists(_this->selectedStreamName)) {
+                _this->streamId = _this->audioStreams.keyId(_this->selectedStreamName);
+            }
+            else {
+                _this->streamId = 0;
+            }
         }
     }
 
     void updateAudioMeter(dsp::stereo_t& lvl) {
-        // Note: Yes, using the natural log is on purpose, it just gives a more beautiful result.
         double frameTime = 1.0 / ImGui::GetIO().Framerate;
         lvl.l = std::clamp<float>(lvl.l - (frameTime * 50.0), -90.0f, 10.0f);
         lvl.r = std::clamp<float>(lvl.r - (frameTime * 50.0), -90.0f, 10.0f);
@@ -451,37 +444,19 @@ private:
         if (dbLvl.r > lvl.r) { lvl.r = dbLvl.r; }
     }
 
-    std::map<int, const char*> radioModeToString = {
-        { RADIO_IFACE_MODE_NFM, "NFM" },
-        { RADIO_IFACE_MODE_WFM, "WFM" },
-        { RADIO_IFACE_MODE_AM,  "AM"  },
-        { RADIO_IFACE_MODE_DSB, "DSB" },
-        { RADIO_IFACE_MODE_USB, "USB" },
-        { RADIO_IFACE_MODE_CW,  "CW"  },
-        { RADIO_IFACE_MODE_LSB, "LSB" },
-        { RADIO_IFACE_MODE_RAW, "RAW" }
-    };
-
     std::string genFileName(std::string templ, int recMode, std::string name) {
-        // Get data
         time_t now = time(0);
-        tm* ltm = localtime(&now);
+        tm ltm_buf;
+        tm* ltm = localtime_r(&now, &ltm_buf);  // thread-safe variant
         double freq = gui::waterfall.getCenterFrequency();
         if (gui::waterfall.vfos.find(name) != gui::waterfall.vfos.end()) {
             freq += gui::waterfall.vfos[name]->generalOffset;
         }
 
-        // Select the recording type string
         std::string type = (recMode == RECORDER_MODE_AUDIO) ? "audio" : "baseband";
 
-        // Format to string (using snprintf only — safe, no buffer overrun)
-        char freqStr[128];
-        char hourStr[128];
-        char minStr[128];
-        char secStr[128];
-        char dayStr[128];
-        char monStr[128];
-        char yearStr[128];
+        char freqStr[128], hourStr[128], minStr[128], secStr[128];
+        char dayStr[128], monStr[128], yearStr[128];
 
         snprintf(freqStr, sizeof freqStr, "%.0lfHz", freq);
         snprintf(hourStr, sizeof hourStr, "%02d", ltm->tm_hour);
@@ -491,8 +466,6 @@ private:
         snprintf(monStr,  sizeof monStr,  "%02d", ltm->tm_mon + 1);
         snprintf(yearStr, sizeof yearStr, "%02d", ltm->tm_year + 1900);
 
-        // FIX: single mode-detection path via RadioModuleInterface (new style only)
-        // Removed redundant legacy modComManager block that was overwriting the result above.
         const char* modeStr = (recMode == RECORDER_MODE_AUDIO) ? "Unknown" : "IQ";
         auto radio = (RadioModuleInterface*)core::moduleManager.getInterface(name, "RadioModuleInterface");
         if (radio) {
@@ -505,7 +478,6 @@ private:
             }
         }
 
-        // Replace in template
         templ = std::regex_replace(templ, std::regex("\\$t"), type);
         templ = std::regex_replace(templ, std::regex("\\$f"), freqStr);
         templ = std::regex_replace(templ, std::regex("\\$h"), hourStr);
@@ -600,7 +572,9 @@ private:
     bool ignoringSilence = false;
     wav::Writer writer;
     std::recursive_mutex recMtx;
-    dsp::stream<dsp::complex_t>* basebandStream;
+
+    // BUG1 FIX: initialize to nullptr — prevents UB if stop() called before baseband recording
+    dsp::stream<dsp::complex_t>* basebandStream = nullptr;
     dsp::stream<dsp::stereo_t> stereoStream;
     dsp::sink::Handler<dsp::complex_t> basebandSink;
     dsp::sink::Handler<dsp::stereo_t> stereoSink;
@@ -619,11 +593,9 @@ private:
 
     EventHandler<std::string> onStreamRegisteredHandler;
     EventHandler<std::string> onStreamUnregisterHandler;
-
 };
 
 MOD_EXPORT void _INIT_() {
-    // Create default recording directory
     std::string root = std::string(core::getRoot());
     if (!std::filesystem::exists(root + "/recordings")) {
         flog::warn("Recordings directory does not exist, creating it");
