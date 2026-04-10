@@ -7,7 +7,6 @@
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
 #include <module.h>
-// #include <unistd.h>
 #include <fstream>
 
 #include <dsp/demod/psk.h>
@@ -32,8 +31,11 @@
 
 #define CONCAT(a, b)    ((std::string(a) + b).c_str())
 
-#define VFO_SAMPLERATE 36000
-#define VFO_BANDWIDTH 30000
+#define VFO_SAMPLERATE  36000
+// FIX: única fonte de verdade para largura de banda do VFO TETRA
+// Antes: construtor usava 30000 e enable() usava 29000 — inconsistência
+// que fazia o frequency_manager salvar/restaurar a largura errada.
+#define VFO_BANDWIDTH   30000
 #define CLOCK_RECOVERY_BW 0.00628f
 #define CLOCK_RECOVERY_DAMPN_F 0.707f
 #define CLOCK_RECOVERY_REL_LIM 0.02f
@@ -72,6 +74,7 @@ public:
         bool startNow = config.conf[name]["sending"];
         config.release(true);
 
+        // FIX: usa VFO_BANDWIDTH (30000) consistente com enable()
         vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, VFO_BANDWIDTH, VFO_SAMPLERATE, VFO_BANDWIDTH, VFO_BANDWIDTH, true);
 
         //Clock recov coeffs
@@ -131,7 +134,8 @@ public:
     void postInit() {}
 
     void enable() {
-        vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, 29000, 36000, 29000, 29000, true);
+        // FIX: usava hardcoded 29000 — agora usa VFO_BANDWIDTH (30000) igual ao construtor
+        vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, VFO_BANDWIDTH, VFO_SAMPLERATE, VFO_BANDWIDTH, VFO_BANDWIDTH, true);
         mainDemodulator.setInput(vfo->output);
         mainDemodulator.start();
         constDiagSplitter.start();
@@ -165,6 +169,15 @@ public:
 
     bool isEnabled() {
         return enabled;
+    }
+
+    // FIX: TETRA nao implementa RadioModuleInterface, entao nao deve responder
+    // a getInterface("RadioModuleInterface") — retorna nullptr para este nome
+    // impedindo que frequency_manager tente chamar RADIO_IFACE_CMD_SET_BANDWIDTH
+    void* getInterface(const char* ifaceName) override {
+        // Explicitamente recusa RadioModuleInterface para evitar crash no applyBookmark
+        if (strcmp(ifaceName, "RadioModuleInterface") == 0) return nullptr;
+        return ModuleManager::Instance::getInterface(ifaceName);
     }
 
 private:
@@ -220,26 +233,23 @@ private:
         ImGui::BeginGroup();
         ImGui::Columns(2, CONCAT("TetraModeColumns##_", _this->name), false);
         if (ImGui::RadioButton(CONCAT("OSMO-TETRA##_", _this->name), _this->decoder_mode == 0) && _this->decoder_mode != 0) {
-            _this->decoder_mode = 0; //osmo-tetra
+            _this->decoder_mode = 0;
             _this->setMode();
         }
         ImGui::NextColumn();
         if (ImGui::RadioButton(CONCAT("NETSYMS##_", _this->name), _this->decoder_mode == 1) && _this->decoder_mode != 1) {
-            _this->decoder_mode = 1; //network symbol streaming
+            _this->decoder_mode = 1;
             _this->setMode();
         }
         ImGui::Columns(1, CONCAT("EndTetraModeColumns##_", _this->name), false);
         ImGui::EndGroup();
 
         if(_this->decoder_mode == 0) {
-            //OSMO-TETRA
             int dec_st = _this->osmotetradecoder.getRxState();
             ImGui::BoxIndicator(ImGui::GetFontSize()*2, (dec_st == 0) ? IM_COL32(230, 5, 5, 255) : ((dec_st == 2) ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 230, 5, 255)));
             ImGui::SameLine();
             ImGui::Text(" Decoder:  %s", (dec_st == 0) ? "Unlocked" : ((dec_st == 2) ? "Locked" : "Know next start"));
-            if(dec_st != 2) {
-                style::beginDisabled();
-            }
+            if(dec_st != 2) { style::beginDisabled(); }
             ImGui::Text("Hyperframe: "); ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%05d", _this->osmotetradecoder.getCurrHyperframe()); ImGui::SameLine();
             ImGui::Text(" | Multiframe: "); ImGui::SameLine();
@@ -249,26 +259,11 @@ private:
             ImGui::Text("Timeslots: ");
             for(int i = 0; i < 4; i++) {
                 switch(_this->osmotetradecoder.getTimeslotContent(i)) {
-                    case 0:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.8, 0.8, 0.8, 1.0), "   UL  ");
-                        break;
-                    case 1:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.95, 0.05, 0.95, 1.0), " DATA  ");
-                        break;
-                    case 2:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "  NDB  ");
-                        break;
-                    case 3:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.05, 0.95, 0.95, 1.0), " SYNC  ");
-                        break;
-                    case 4:
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.05, 0.95, 0.05, 1.0), " VOICE ");
-                        break;
+                    case 0: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.8,0.8,0.8,1.0),"   UL  "); break;
+                    case 1: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95,0.05,0.95,1.0)," DATA  "); break;
+                    case 2: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"  NDB  "); break;
+                    case 3: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05,0.95,0.95,1.0)," SYNC  "); break;
+                    case 4: ImGui::SameLine(); ImGui::TextColored(ImVec4(0.05,0.95,0.05,1.0)," VOICE "); break;
                 }
             }
             int crc_failed = _this->osmotetradecoder.getLastCrcFail();
@@ -287,48 +282,43 @@ private:
             int dl_usg = _this->osmotetradecoder.getDlUsage();
             int ul_usg = _this->osmotetradecoder.getUlUsage();
             ImGui::Text("DL:");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getDlFreq()/1000000.0f));ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%7.3f",((float)_this->osmotetradecoder.getDlFreq()/1000000.0f));ImGui::SameLine();
             ImGui::Text(" MHz ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (dl_usg == 0 ? "Unalloc" : (dl_usg == 1 ? "Assigned ctl" : (dl_usg == 2 ? "Common ctl" : (dl_usg == 3 ? "Reserved" : "Traffic")))));
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),(dl_usg==0?"Unalloc":(dl_usg==1?"Assigned ctl":(dl_usg==2?"Common ctl":(dl_usg==3?"Reserved":"Traffic")))));
             ImGui::Text("UL:");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%7.3f", ((float)_this->osmotetradecoder.getUlFreq()/1000000.0f));ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%7.3f",((float)_this->osmotetradecoder.getUlFreq()/1000000.0f));ImGui::SameLine();
             ImGui::Text(" MHz ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), (ul_usg == 0 ? "Unalloc" : "Traffic"));
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),(ul_usg==0?"Unalloc":"Traffic"));
             ImGui::Text("Access1: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess1Code());ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%c",_this->osmotetradecoder.getAccess1Code());ImGui::SameLine();
             ImGui::Text("/");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess1());ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%d",_this->osmotetradecoder.getAccess1());ImGui::SameLine();
             ImGui::Text("| Access2: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%c", _this->osmotetradecoder.getAccess2Code());ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%c",_this->osmotetradecoder.getAccess2Code());ImGui::SameLine();
             ImGui::Text("/");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%d", _this->osmotetradecoder.getAccess2());
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%d",_this->osmotetradecoder.getAccess2());
             ImGui::Text("MCC: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMcc());ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%03d",_this->osmotetradecoder.getMcc());ImGui::SameLine();
             ImGui::Text("| MNC: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "%03d", _this->osmotetradecoder.getMnc());ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"%03d",_this->osmotetradecoder.getMnc());ImGui::SameLine();
             ImGui::Text("| CC: ");ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95, 0.95, 0.05, 1.0), "0x%02x", _this->osmotetradecoder.getCc());
-            ImVec4 on_color = ImVec4(0.05, 0.95, 0.05, 1.0);
-            ImVec4 off_color = ImVec4(0.95, 0.05, 0.05, 1.0);
-            ImGui::TextColored(_this->osmotetradecoder.getAdvancedLink() ? on_color : off_color, "Adv. link  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getAirEncryption() ? on_color : off_color, "Encryption  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getSndcpData() ? on_color : off_color, "SNDCP");
-            ImGui::TextColored(_this->osmotetradecoder.getCircuitData() ? on_color : off_color, "Circuit data  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getVoiceService() ? on_color : off_color, "Voice  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getNormalMode() ? on_color : off_color, "Normal mode");
-            ImGui::TextColored(_this->osmotetradecoder.getMigrationSupported() ? on_color : off_color, "Migration  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getNeverMinimumMode() ? on_color : off_color, "Never min mode  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getPriorityCell() ? on_color : off_color, "Priority cell");
-            ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory() ? on_color : off_color, "Dereg req.  ");ImGui::SameLine();
-            ImGui::TextColored(_this->osmotetradecoder.getRegMandatory() ? on_color : off_color, "Reg req.");
-            if(crc_failed) {
-                style::endDisabled();
-            }
-            if(dec_st != 2) {
-                style::endDisabled();
-            }
+            ImGui::TextColored(ImVec4(0.95,0.95,0.05,1.0),"0x%02x",_this->osmotetradecoder.getCc());
+            ImVec4 on_color=ImVec4(0.05,0.95,0.05,1.0);
+            ImVec4 off_color=ImVec4(0.95,0.05,0.05,1.0);
+            ImGui::TextColored(_this->osmotetradecoder.getAdvancedLink()?on_color:off_color,"Adv. link  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getAirEncryption()?on_color:off_color,"Encryption  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getSndcpData()?on_color:off_color,"SNDCP");
+            ImGui::TextColored(_this->osmotetradecoder.getCircuitData()?on_color:off_color,"Circuit data  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getVoiceService()?on_color:off_color,"Voice  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getNormalMode()?on_color:off_color,"Normal mode");
+            ImGui::TextColored(_this->osmotetradecoder.getMigrationSupported()?on_color:off_color,"Migration  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getNeverMinimumMode()?on_color:off_color,"Never min mode  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getPriorityCell()?on_color:off_color,"Priority cell");
+            ImGui::TextColored(_this->osmotetradecoder.getDeregMandatory()?on_color:off_color,"Dereg req.  ");ImGui::SameLine();
+            ImGui::TextColored(_this->osmotetradecoder.getRegMandatory()?on_color:off_color,"Reg req.");
+            if(crc_failed) { style::endDisabled(); }
+            if(dec_st != 2) { style::endDisabled(); }
         } else {
-            //NETWORK SYM STREAMING
             ImGui::BoxIndicator(menuWidth, _this->tsfound ? IM_COL32(5, 230, 5, 255) : IM_COL32(230, 5, 5, 255));
             ImGui::SameLine();
             ImGui::Text(" Training sequences");
@@ -369,9 +359,7 @@ private:
                 ImGui::TextUnformatted("Idle");
             }
         }
-        if(!_this->enabled) {
-            style::endDisabled();
-        }
+        if(!_this->enabled) { style::endDisabled(); }
     }
 
     static void _constDiagSinkHandler(dsp::complex_t* data, int count, void* ctx) {
@@ -407,9 +395,7 @@ private:
             }
             if(_this->symsbeforeexpire > 0) {
                 _this->symsbeforeexpire--;
-                if(_this->symsbeforeexpire == 0) {
-                    _this->tsfound = false;
-                }
+                if(_this->symsbeforeexpire == 0) { _this->tsfound = false; }
             }
         }
     }
@@ -449,23 +435,15 @@ private:
     SinkManager::Stream stream;
     double audioSampleRate = 48000.0;
 
-
     int decoder_mode = 0;
 
-
-    //Sequences from osmo-tetra-sq5bpf source
-    /* 9.4.4.3.2 Normal Training Sequence */
     static const constexpr uint8_t training_seq_n[22] = { 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0 };
     static const constexpr uint8_t training_seq_p[22] = { 0,1, 1,1, 1,0, 1,0, 0,1, 0,0, 0,0, 1,1, 0,1, 1,1, 1,0 };
     static const constexpr uint8_t training_seq_q[22] = { 1,0, 1,1, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 1,0, 1,1, 0,1 };
     static const constexpr uint8_t training_seq_N[33] = { 1,1,1, 0,0,1, 1,0,1, 1,1,1, 0,0,0, 1,1,1, 1,0,0, 0,1,1, 1,1,0, 0,0,0, 0,0,0 };
     static const constexpr uint8_t training_seq_P[33] = { 1,0,1, 0,1,1, 1,1,1, 1,0,1, 0,1,0, 1,0,1, 1,1,0, 0,0,1, 1,0,0, 0,1,0, 0,1,0 };
-
-    /* 9.4.4.3.3 Extended training sequence */
     static const constexpr uint8_t training_seq_x[30] = { 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,1, 0,0, 0,0, 1,1 };
     static const constexpr uint8_t training_seq_X[45] = { 0,1,1,1,0,0,1,1,0,1,0,0,0,0,1,0,0,0,1,1,1,0,1,1,0,1,0,1,0,1,1,1,1,1,0,1,0,0,0,0,0,1,1,1,0 };
-
-    /* 9.4.4.3.4 Synchronization training sequence */
     static const constexpr uint8_t training_seq_y[38] = { 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1, 0,0, 1,1, 1,0, 1,0, 0,1, 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1 };
     uint8_t tsfind_buffer[45];
     bool tsfound = false;
@@ -475,7 +453,6 @@ private:
     int port = 8355;
 
     std::shared_ptr<net::Socket> conn;
-
 };
 
 MOD_EXPORT void _INIT_() {
