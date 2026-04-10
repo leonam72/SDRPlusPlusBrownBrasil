@@ -1,5 +1,6 @@
 #pragma once
 #include "../processor.h"
+#include <volk/volk.h>
 
 namespace dsp::math {
     class Conjugate : public Processor<complex_t, complex_t> {
